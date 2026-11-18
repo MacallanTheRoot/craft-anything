@@ -117,12 +117,27 @@ pub fn tr(s: &str) -> String {
     }
 }
 
-/// Translate, then fill `{name}` placeholders.
+/// Translate, then fill `{name}` placeholders without interpreting inserted values.
 pub fn trf(s: &str, args: &[(&str, &str)]) -> String {
-    let mut out = tr(s);
-    for (k, v) in args {
-        out = out.replace(&format!("{{{k}}}"), v);
+    let template = tr(s);
+    let mut out = String::with_capacity(template.len());
+    let mut remaining = template.as_str();
+    while let Some(start) = remaining.find('{') {
+        out.push_str(&remaining[..start]);
+        let tail = &remaining[start + 1..];
+        let Some(end) = tail.find('}') else {
+            out.push_str(&remaining[start..]);
+            return out;
+        };
+        let key = &tail[..end];
+        if let Some((_, value)) = args.iter().rev().find(|(name, _)| *name == key) {
+            out.push_str(value);
+        } else {
+            out.push_str(&remaining[start..start + end + 2]);
+        }
+        remaining = &tail[end + 1..];
     }
+    out.push_str(remaining);
     out
 }
 
@@ -137,6 +152,27 @@ mod tests {
         assert!(!m.contains_key("Empty"));
         assert_eq!(trf("Open {name}", &[("name", "a.exe")]), "Open a.exe");
         assert_eq!(tr("Untranslated"), "Untranslated");
+    }
+
+    /// Interpolation never treats already inserted values as a second template.
+    #[test]
+    fn trf_keeps_inserted_placeholder_like_values_literal() {
+        assert_eq!(
+            trf("{first} then {second}", &[("first", "{second}"), ("second", "AI")]),
+            "{second} then AI"
+        );
+        assert_eq!(
+            trf("{second} then {first}", &[("first", "{second}"), ("second", "AI")]),
+            "AI then {second}"
+        );
+        assert_eq!(
+            trf("{name} / {name}", &[("name", "Özel {name}")]),
+            "Özel {name} / Özel {name}"
+        );
+        assert_eq!(trf("{missing} {name}", &[("name", "AI")]), "{missing} AI");
+        assert_eq!(trf("Open {name", &[("name", "AI")]), "Open {name");
+        assert_eq!(trf("Open {name}", &[("name", "first"), ("name", "last")]), "Open last");
+        assert_eq!(trf("No placeholders", &[("name", "AI")]), "No placeholders");
     }
 
     /// Script and region matching: an explicit script wins over a region, a registered language
