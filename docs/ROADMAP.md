@@ -1519,6 +1519,7 @@ Gaps found while using the app for real projects.
 - [ ] `i18n::trf` fills placeholders with repeated replacements, so a value containing a later
       placeholder can be rewritten. Keep inserted names and other values literal; the R5.5
       saved-builder notice handles its two placeholders locally without changing other UI text
+      — claimed: MacallanTheRoot, branch bugfix/r2.9-literal-trf-placeholders
 - [x] Each project chooses, per kind of action, what the builder's approvals get (allow, ask or
       refuse): reading the web, commands, files outside the project, pushing and publishing,
       deleting outside the project, system changes, other tools. Unset kinds follow Auto mode as
