@@ -58,7 +58,15 @@ through its route captures and Deep Mode. Saving a sign-in afterward does not up
 study. A signed-in study refuses a different saved-account revision on reopen. Each Deep reader
 (JavaScript analysis, observation and traffic recording) uses the verified browser's explicit
 local endpoint, so it cannot fall back to another session or launch a replacement browser.
-Reopen failures and cancellation stop the study before further readers or publication.
+Root and Deep reopen failures stop the study before further readers or publication. An ordinary
+optional route page-load failure is reported and skipped without photographing the failed page.
+Every route that opens successfully still has its site, profile and account revision verified;
+authentication integrity failures and cancellation stop immediately.
+
+Optional route captures use a private staging folder in the project investigation storage.
+Only successful captures are published under `capture/routes/`. A failed attempt is discarded
+without removing successful routes or unrelated capture files. Cleanup failures stop the study;
+unexpected existing folders or links remain untouched and fail closed.
 
 Deep Mode records its profile provenance in `capture.json` after collecting its artifacts. The
 approval gate checks that provenance against the captured pages before it can skip confirmation

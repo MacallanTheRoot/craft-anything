@@ -526,6 +526,7 @@ fn review_fix_unindexed_private_route_is_still_reviewed() {
 // builder turn are real. No CDP server, real profile, browser process or network is used.
 #[derive(Clone, Default)]
 struct SyntheticBrowser {
+    url: String,
     signed_in: bool,
     revision: Option<String>,
     endpoint: String,
@@ -542,6 +543,13 @@ struct DeepStudyFixture {
     live: SyntheticBrowser,
     browsers: HashMap<String, SyntheticBrowser>,
     reads: Vec<(String, bool)>,
+    optional_routes: bool,
+    route_open_error: Option<ErrorCode>,
+    route_capture_error: Option<ErrorCode>,
+    route_identity_failure: Option<&'static str>,
+    existing_route: Option<&'static str>,
+    capture_urls: Vec<String>,
+    capture_paths: Vec<PathBuf>,
 }
 
 fn synthetic_account(session: &craft_anything_engine::Session, revision: &str) {
@@ -564,6 +572,13 @@ fn synthetic_study_tool(ctx: &mut craft_anything_engine::Ctx<'_>, params: Value)
     match ctx.tool {
         "web_site_open" => {
             state.opens += 1;
+            if params["url"].as_str().is_some_and(|u| u.ends_with("/broken"))
+                && let Some(code) = state.route_open_error
+            {
+                // Failed navigation leaves a session that must never be captured as this route.
+                state.live.url = "https://wrong.test/unintended".into();
+                return Err(ToolError::new(code, "Synthetic optional route did not open"));
+            }
             if deep_open && state.reopen_error {
                 // A failed navigation/start may leave an older signed-in session alive.
                 state.live.signed_in = true;
@@ -572,6 +587,7 @@ fn synthetic_study_tool(ctx: &mut craft_anything_engine::Ctx<'_>, params: Value)
             let saved = site_sign_in::saved(ctx.session, "site-example.test_443");
             let signed_in = params.get("signed_in").and_then(Value::as_bool).unwrap_or(saved.is_some());
             let browser = SyntheticBrowser {
+                url: params["url"].as_str().unwrap().to_string(),
                 signed_in,
                 revision: if signed_in { Some(saved.unwrap().revision) } else { None },
                 endpoint: format!("http://127.0.0.1:{}", 41000 + state.opens),
@@ -579,24 +595,75 @@ fn synthetic_study_tool(ctx: &mut craft_anything_engine::Ctx<'_>, params: Value)
             state.browsers.insert(browser.endpoint.clone(), browser.clone());
             state.live = browser.clone();
             if deep_open && state.replace_live_after_reopen {
-                state.live = SyntheticBrowser { signed_in: true, revision: Some("unintended-account".into()), endpoint: "http://127.0.0.1:42000".into() };
+                state.live = SyntheticBrowser {
+                    signed_in: true,
+                    revision: Some("unintended-account".into()),
+                    endpoint: "http://127.0.0.1:42000".into(),
+                    ..Default::default()
+                };
             }
-            Ok(ToolOutput::Value(json!({"url":params["url"],"signed_in":browser.signed_in,
+            let mut result = json!({"url":params["url"],"signed_in":browser.signed_in,
                 "signed_in_site":if browser.signed_in { Some("site-example.test_443") } else { None },
-                "sign_in_revision":browser.revision,"cdp_endpoint":browser.endpoint})))
+                "sign_in_revision":browser.revision,"cdp_endpoint":browser.endpoint});
+            if params["url"].as_str().is_some_and(|u| u.ends_with("/broken")) {
+                match state.route_identity_failure {
+                    Some("revision") => result["sign_in_revision"] = json!("unexpected-account"),
+                    Some("site") => result["signed_in_site"] = json!("site-wrong.test_443"),
+                    Some("profile") => result["signed_in"] = json!(false),
+                    Some("endpoint") => result["cdp_endpoint"] = json!("http://remote.test:9222"),
+                    _ => {}
+                }
+            }
+            Ok(ToolOutput::Value(result))
         }
         "web_site_capture" => {
             state.captures += 1;
             let dir = PathBuf::from(params["output_directory"].as_str().unwrap());
+            let url = state.live.url.clone();
+            state.capture_urls.push(url.clone());
+            state.capture_paths.push(dir.clone());
             std::fs::create_dir_all(&dir).unwrap();
+            if url.ends_with("/broken")
+                && let Some(code) = state.route_capture_error
+            {
+                std::fs::write(dir.join("partial.tmp"), "Synthetic incomplete route").unwrap();
+                return Err(ToolError::new(code, "Synthetic route capture failed after creating its folder"));
+            }
             std::fs::write(dir.join("screenshot-1440.png"), encode_png(&Image { width: 2, height: 2, rgba: vec![80; 16] }).unwrap()).unwrap();
             std::fs::write(dir.join("README.md"), "Synthetic account dashboard").unwrap();
-            let root = state.captures % 2 == 1;
-            let metadata = json!({"url":if root { "https://example.test/app" } else { "https://example.test/account" },
+            let root = url.ends_with("/app");
+            let links = if !root {
+                Vec::new()
+            } else if state.optional_routes {
+                vec!["account", "broken", "settings"]
+            } else {
+                vec!["account"]
+            };
+            let metadata = json!({"url":url,
                 "signed_in":state.live.signed_in,"signed_in_site":if state.live.signed_in { Some("site-example.test_443") } else { None },
                 "sign_in_revision":state.live.revision,"sign_in_page":false,"screenshots":[{"file":"screenshot-1440.png"}],
-                "links":if root { json!([{"href":"https://example.test/account"}]) } else { json!([]) }});
+                "links":links.iter().map(|r| json!({"href":format!("https://example.test/{r}")})).collect::<Vec<_>>() });
             std::fs::write(dir.join("capture.json"), serde_json::to_vec(&metadata).unwrap()).unwrap();
+            if root && state.optional_routes {
+                std::fs::write(dir.join("keep.txt"), "Unrelated root evidence").unwrap();
+                if let Some(kind) = state.existing_route {
+                    let existing = dir.join("routes/broken");
+                    std::fs::create_dir_all(&existing).unwrap();
+                    std::fs::write(existing.join("keep.txt"), "Pre-existing route evidence").unwrap();
+                    if kind == "successful" {
+                        std::fs::copy(dir.join("capture.json"), existing.join("capture.json")).unwrap();
+                        std::fs::copy(dir.join("screenshot-1440.png"), existing.join("screenshot-1440.png")).unwrap();
+                    }
+                    #[cfg(unix)]
+                    if kind == "link" {
+                        let outside = ctx.session.config_dir().join("outside-route");
+                        std::fs::create_dir_all(&outside).unwrap();
+                        std::fs::write(outside.join("keep.txt"), "Outside project evidence").unwrap();
+                        std::fs::remove_dir_all(&existing).unwrap();
+                        std::os::unix::fs::symlink(outside, &existing).unwrap();
+                    }
+                }
+            }
             if !root && state.change_after_routes {
                 synthetic_account(ctx.session, "fixture-account-2");
             }
@@ -615,7 +682,8 @@ fn synthetic_study_tool(ctx: &mut craft_anything_engine::Ctx<'_>, params: Value)
                     Environment::builtin(false),
                 )
                 .summary("Synthetic recording")
-                .result(json!({"network":{"requests":[{"url":"https://example.test/data","response_body":content}]}}))
+                .result(json!({"network":{"requests":[{"url":"https://example.test/data",
+                    "response_body":{"state":"captured","text":if browser.signed_in { PRIVATE_HAR_MARKER } else { PUBLIC_HAR_MARKER }}}]}}))
                 .build()
                 .unwrap();
                 Ok(ToolOutput::evidence(ev))
@@ -629,11 +697,12 @@ fn synthetic_study_tool(ctx: &mut craft_anything_engine::Ctx<'_>, params: Value)
 impl Fixture {
     fn fresh_deep(signed_in: bool, state: DeepStudyFixture) -> (Self, Arc<Mutex<DeepStudyFixture>>) {
         let mut f = Self::new(signed_in);
+        let optional_routes = state.optional_routes;
         let state = Arc::new(Mutex::new(state));
         let mut session = craft_anything_engine::testing::session();
         session.settings.deep_mode = true;
         session.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
-        session.settings.build.max_pages = 1;
+        session.settings.build.max_pages = if optional_routes { 3 } else { 1 };
         session.ext.insert(state.clone());
         let callbacks: Vec<_> =
             ["web_site_open", "web_site_capture", "web_page_states_capture", "web_page_js_analyze", "web_page_watch", "web_walkthrough_record"]
@@ -773,5 +842,155 @@ fn deep_profile_unattested_legacy_artifacts_are_invalidated_before_build() {
         f.run(|_, _| panic!("legacy Deep artifacts have no trustworthy profile provenance"));
         assert!(f.seen.lock().unwrap().is_empty());
         f.assert_invalidated_and_restudied();
+    }
+}
+
+const PRIVATE_HAR_MARKER: &str = "Synthetic PRIVATE HAR response only";
+const PUBLIC_HAR_MARKER: &str = "Synthetic PUBLIC HAR response only";
+
+#[test]
+fn route_review_failed_partial_capture_is_removed_without_losing_successes() {
+    for signed_in in [false, true] {
+        let (mut f, state) = Fixture::fresh_deep(
+            signed_in,
+            DeepStudyFixture { optional_routes: true, route_capture_error: Some(ErrorCode::ProgramFailed), ..Default::default() },
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.worker.tx = tx;
+        f.run(|i, r| i.answer(&r.id, &Answer { allow: Some(true), ..Default::default() }).unwrap());
+        assert!(!f.ws.capture_dir().join("routes/broken").exists(), "a failed optional capture left a partial route");
+        assert_eq!(f.seen.lock().unwrap().len(), 1, "a failed optional route prevented a valid build");
+        for name in ["account", "settings"] {
+            assert!(f.ws.capture_dir().join("routes").join(name).join("capture.json").is_file());
+            assert_eq!(std::fs::read_to_string(f.ws.capture_dir().join("routes").join(name).join("README.md")).unwrap(), "Synthetic account dashboard");
+        }
+        assert_eq!(std::fs::read_to_string(f.ws.capture_dir().join("keep.txt")).unwrap(), "Unrelated root evidence");
+        let kept: Vec<kinds::website::Route> = serde_json::from_slice(&std::fs::read(f.ws.capture_dir().join("routes.json")).unwrap()).unwrap();
+        assert!(kept.iter().all(|r| r.slug != "broken"));
+        assert_eq!(kept.len(), 2);
+        assert!(state.lock().unwrap().capture_paths.iter().all(|p| !p.join("partial.tmp").exists()), "failed attempt storage was retained");
+        assert!(rx.try_iter().any(|e| matches!(e,RunEvent::Step {text,..} if text.contains("Couldn't photograph /broken"))));
+    }
+}
+
+#[test]
+fn route_review_navigation_failure_is_reported_without_capturing_the_old_session() {
+    let (mut f, state) =
+        Fixture::fresh_deep(false, DeepStudyFixture { optional_routes: true, route_open_error: Some(ErrorCode::ProgramFailed), ..Default::default() });
+    let (tx, rx) = std::sync::mpsc::channel();
+    f.worker.tx = tx;
+    f.run(|_, _| panic!("a fully unsigned study needs no approval"));
+    assert_eq!(f.seen.lock().unwrap().len(), 1, "ordinary linked-page navigation failure stopped Study");
+    assert!(state.lock().unwrap().capture_urls.iter().all(|u| !u.ends_with("/broken") && !u.contains("unintended")));
+    assert!(f.ws.capture_dir().join("routes/settings/capture.json").is_file());
+    assert!(!f.ws.capture_dir().join("routes/broken").exists());
+    assert!(rx.try_iter().any(|e| matches!(e,RunEvent::Step {text,..} if text.contains("/broken")&&text.contains("Synthetic optional route did not open"))));
+}
+
+#[test]
+fn route_review_navigation_integrity_errors_are_not_optional() {
+    for code in [
+        ErrorCode::Cancelled,
+        ErrorCode::NoPermission,
+        ErrorCode::StaleRevision,
+        ErrorCode::ConsentRequired,
+        ErrorCode::FileChanged,
+        ErrorCode::EvidenceHashMismatch,
+    ] {
+        let (mut f, state) = Fixture::fresh_deep(true, DeepStudyFixture { optional_routes: true, route_open_error: Some(code), ..Default::default() });
+        let err = f.run(|_, _| panic!("integrity errors cannot be approved"));
+        assert_eq!(err.code, code);
+        assert!(f.seen.lock().unwrap().is_empty());
+        assert!(state.lock().unwrap().reads.is_empty());
+        assert!(state.lock().unwrap().capture_urls.iter().all(|u| !u.ends_with("/broken") && !u.ends_with("/settings") && !u.contains("unintended")));
+        assert_eq!(Workspace::open(&f.ws.root).unwrap().manifest.capture_deep, None);
+    }
+}
+
+#[test]
+fn route_review_successful_opens_still_require_the_original_identity() {
+    for kind in ["revision", "site", "profile", "endpoint"] {
+        let (mut f, state) = Fixture::fresh_deep(true, DeepStudyFixture { optional_routes: true, route_identity_failure: Some(kind), ..Default::default() });
+        let err = f.run(|_, _| panic!("changed browser identities cannot be approved"));
+        assert_eq!(err.code, ErrorCode::NoPermission);
+        assert!(f.seen.lock().unwrap().is_empty());
+        assert!(state.lock().unwrap().capture_urls.iter().all(|u| !u.ends_with("/broken") && !u.ends_with("/settings")));
+        assert!(state.lock().unwrap().reads.is_empty());
+        assert_eq!(Workspace::open(&f.ws.root).unwrap().manifest.capture_deep, None);
+    }
+}
+
+#[test]
+fn route_review_capture_integrity_errors_stop_before_the_next_route() {
+    for code in [
+        ErrorCode::NoPermission,
+        ErrorCode::Cancelled,
+        ErrorCode::StaleRevision,
+        ErrorCode::FileHashMismatch,
+        ErrorCode::EvidenceHashMismatch,
+        ErrorCode::ConsentRequired,
+    ] {
+        let (mut f, state) = Fixture::fresh_deep(true, DeepStudyFixture { optional_routes: true, route_capture_error: Some(code), ..Default::default() });
+        let err = f.run(|_, _| panic!("capture integrity errors cannot be approved"));
+        assert_eq!(err.code, code);
+        assert!(state.lock().unwrap().capture_urls.iter().all(|u| !u.ends_with("/settings")), "continued after {code:?}");
+        assert!(f.seen.lock().unwrap().is_empty());
+        assert!(state.lock().unwrap().reads.is_empty());
+        assert!(!f.ws.capture_dir().join("routes/broken").exists());
+        assert!(state.lock().unwrap().capture_paths.iter().all(|p| !p.join("partial.tmp").exists()));
+        assert_eq!(Workspace::open(&f.ws.root).unwrap().manifest.capture_deep, None);
+    }
+}
+
+#[test]
+fn route_review_unexpected_route_folders_are_preserved_and_fail_closed() {
+    for kind in ["partial", "successful"] {
+        let (mut f, _) = Fixture::fresh_deep(false, DeepStudyFixture { optional_routes: true, existing_route: Some(kind), ..Default::default() });
+        f.run(|_, _| panic!("unexpected route folders must not be silently reused"));
+        assert!(f.seen.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(f.ws.capture_dir().join("routes/broken/keep.txt")).unwrap(), "Pre-existing route evidence");
+        if kind == "successful" {
+            assert!(f.ws.capture_dir().join("routes/broken/capture.json").is_file());
+        }
+        assert_eq!(Workspace::open(&f.ws.root).unwrap().manifest.capture_deep, None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn route_review_unexpected_route_links_are_not_followed_or_removed() {
+    let (mut f, _) = Fixture::fresh_deep(false, DeepStudyFixture { optional_routes: true, existing_route: Some("link"), ..Default::default() });
+    f.run(|_, _| panic!("route links cannot be approved"));
+    assert!(f.seen.lock().unwrap().is_empty());
+    assert!(std::fs::symlink_metadata(f.ws.capture_dir().join("routes/broken")).unwrap().file_type().is_symlink());
+    let outside = f.worker.engine.session().config_dir().join("outside-route/keep.txt");
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "Outside project evidence");
+}
+
+#[test]
+fn route_review_har_body_is_retained_and_released_only_after_confirmation() {
+    for allow in [false, true] {
+        let (mut f, _) = Fixture::fresh_deep(true, DeepStudyFixture::default());
+        let root = f.ws.root.clone();
+        let seen = f.seen.clone();
+        let asked = Arc::new(AtomicBool::new(false));
+        let asked2 = asked.clone();
+        f.run(move |i, r| {
+            asked2.store(true, Ordering::SeqCst);
+            assert!(seen.lock().unwrap().is_empty(), "the builder read account content before confirmation");
+            let notes = std::fs::read_to_string(root.join("capture/how-it-works.md")).unwrap();
+            assert!(notes.contains("Synthetic PRIVATE Deep artifact"));
+            assert!(!notes.contains(PRIVATE_HAR_MARKER), "HAR assertions must not pass from the notes");
+            let raw = std::fs::read_to_string(root.join("capture/original.har")).unwrap();
+            let har: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(har.pointer("/log/entries/0/response/content/text").and_then(Value::as_str), Some(PRIVATE_HAR_MARKER));
+            assert!(raw.contains(PRIVATE_HAR_MARKER));
+            assert!(!raw.contains(PUBLIC_HAR_MARKER));
+            i.answer(&r.id, &Answer { allow: Some(allow), ..Default::default() }).unwrap();
+        });
+        assert!(asked.load(Ordering::SeqCst));
+        assert_eq!(f.seen.lock().unwrap().len(), usize::from(allow));
+        let observed = f.seen.lock().unwrap();
+        assert_eq!(observed.iter().any(|s| s.contains(PRIVATE_HAR_MARKER)), allow);
     }
 }

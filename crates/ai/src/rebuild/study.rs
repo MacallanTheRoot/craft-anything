@@ -42,6 +42,62 @@ fn invalidate_capture(ws: &mut Workspace) -> Result<(), ToolError> {
     ws.save()
 }
 
+/// Own only this attempt's private storage, outside capture/: incomplete routes must not be
+/// mistaken for study evidence. Existing routes are never cleanup targets.
+struct RouteCaptureStage {
+    dir: PathBuf,
+    cleaned: bool,
+}
+
+impl RouteCaptureStage {
+    fn new(ws: &Workspace) -> Result<Self, ToolError> {
+        let base = ws.investigation_dir();
+        let meta = std::fs::symlink_metadata(&base).map_err(|e| ToolError::io(base.display(), e))?;
+        if !meta.is_dir() || meta.file_type().is_symlink() || !craft_anything_engine::workspace::really_inside(&ws.root, &base) {
+            return Err(ToolError::new(ErrorCode::NoPermission, "Route capture storage must be a regular folder inside this project."));
+        }
+        let dir = craft_anything_engine::tools::artifact_tools::fresh_dir_in(&base, "route-capture")?;
+        Ok(Self { dir, cleaned: false })
+    }
+
+    fn close(mut self) -> Result<(), ToolError> {
+        std::fs::remove_dir_all(&self.dir).map_err(|e| {
+            ToolError::new(ErrorCode::CleanupFailed, format!("The temporary route capture could not be removed: {e}"))
+                .with_remediation("Check permissions in this project's investigation folder, then start a new study.")
+        })?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for RouteCaptureStage {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+fn absent_route(capture: &Path, slug: &str) -> Result<PathBuf, ToolError> {
+    let unsafe_path = || ToolError::new(ErrorCode::NoPermission, "A route folder already exists or is not safe. Start a fresh study.");
+    if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(unsafe_path());
+    }
+    let routes = capture.join("routes");
+    for parent in [capture, routes.as_path()] {
+        let meta = std::fs::symlink_metadata(parent).map_err(|e| ToolError::io(parent.display(), e))?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(unsafe_path());
+        }
+    }
+    let dir = routes.join(slug);
+    match std::fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(dir),
+        Err(e) => Err(ToolError::io(dir.display(), e)),
+        Ok(_) => Err(unsafe_path()),
+    }
+}
+
 impl Worker {
     /// One approval per run, bound to the exact capture and target. Auto mode and a project's
     /// action preferences never authorize captured account data. A restart posts a new id.
@@ -357,7 +413,7 @@ impl Worker {
     /// The site's other pages (up to `build.max_pages` same-site pages: links from the start
     /// page, then links from those pages while there's room), each captured into
     /// capture/routes/<name>/ and listed in capture/routes.json. Capture failures are reported;
-    /// navigation failures, identity changes and cancellation stop the study.
+    /// ordinary page-load failures are skipped; identity failures and cancellation stop it.
     fn capture_routes(&mut self, ws: &mut Workspace, start: &str, widths: &[u32], profile: &StudyProfile) -> Result<(), ToolError> {
         let capture = ws.capture_dir();
         let read = |dir: &Path| std::fs::read(dir.join("capture.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
@@ -390,20 +446,57 @@ impl Worker {
         let mut kept = Vec::new();
         if !picked.is_empty() {
             // web_site_capture creates its own folder, inside one that exists.
-            std::fs::create_dir_all(capture.join("routes")).map_err(|e| ToolError::io(capture.display(), e))?;
+            let routes = capture.join("routes");
+            match std::fs::create_dir(&routes) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(ToolError::io(routes.display(), e)),
+            }
         }
         for (i, r) in picked.iter().enumerate() {
             self.step(ws, Step::Study, Status::Inspecting, &format!("Photographing more pages ({} of {}): {}…", i + 1, picked.len(), r.path))?;
-            let dir = capture.join("routes").join(&r.slug);
-            let opened = self.call("web_site_open", profile.open_params(&r.url))?;
+            let dir = absent_route(&capture, &r.slug)?;
+            let opened = match self.call("web_site_open", profile.open_params(&r.url)) {
+                Ok(opened) => opened,
+                // Page.navigate's ordinary errorText is ProgramFailed. Other errors may
+                // indicate permission, profile, revision or cancellation failures: stop.
+                Err(e) if e.code == ErrorCode::ProgramFailed => {
+                    self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't open {}: {}", r.path, e.message))?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             profile.reopened(&r.url, &opened)?;
-            let got = self
-                .call("web_site_capture", json!({"output_directory": dir.display().to_string(), "include_html": false, "widths": widths, "noise_pass": true}));
+            let stage = RouteCaptureStage::new(ws)?;
+            let output = stage.dir.join("page");
+            let got = self.call(
+                "web_site_capture",
+                json!({"output_directory": output.display().to_string(), "include_html": false, "widths": widths, "noise_pass": true}),
+            );
+            self.stop.check()?;
+            if got.is_ok() {
+                // Recheck before publishing; never replace a previous or unexpected route.
+                absent_route(&capture, &r.slug)?;
+                std::fs::rename(&output, &dir).map_err(|e| ToolError::io(dir.display(), e))?;
+            }
+            stage.close()?;
             match got {
                 Ok(_) => kept.push(r.clone()),
-                Err(e) if e.code == ErrorCode::Cancelled => return Err(e),
-                // Said in the feed, not hidden: the page is left out and the study goes on.
-                Err(e) => self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't photograph {}: {}", r.path, e.message))?,
+                Err(e)
+                    if matches!(
+                        e.code,
+                        ErrorCode::ProgramFailed
+                            | ErrorCode::TimedOut
+                            | ErrorCode::GarbledOutput
+                            | ErrorCode::OverLimit
+                            | ErrorCode::NotFound
+                            | ErrorCode::FileError
+                            | ErrorCode::RecordingFailed
+                    ) =>
+                {
+                    self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't photograph {}: {}", r.path, e.message))?;
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(kept)
