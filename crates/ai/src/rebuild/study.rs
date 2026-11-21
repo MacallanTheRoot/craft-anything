@@ -33,6 +33,14 @@ pub(super) fn tools_run_remotely(over_ssh: bool, api_loop: bool) -> bool {
     over_ssh && !api_loop
 }
 
+/// Retain the files for inspection, but make a retry study again. Reload first so validation
+/// failure cannot overwrite concurrent edits to the project's target or other manifest fields.
+fn invalidate_capture(ws: &mut Workspace) -> Result<(), ToolError> {
+    *ws = Workspace::open(&ws.root)?;
+    ws.manifest.capture_deep = None;
+    ws.save()
+}
+
 impl Worker {
     /// One approval per run, bound to the exact capture and target. Auto mode and a project's
     /// action preferences never authorize captured account data. A restart posts a new id.
@@ -45,7 +53,14 @@ impl Worker {
             site_sign_in::saved(&engine.session(), &key)
         };
         let saved = saved_for(ws);
-        let Some(review) = capture_review::prepare(ws, saved.as_ref())? else { return Ok(()) };
+        let review = match capture_review::prepare(ws, saved.as_ref()) {
+            Ok(review) => review,
+            Err(error) => {
+                invalidate_capture(ws)?;
+                return Err(error);
+            }
+        };
+        let Some(review) = review else { return Ok(()) };
         self.inbox.withdraw_capture_reviews()?;
         self.step(ws, Step::Study, Status::NeedsYou, "Check the first screenshots before the builder uses this signed-in capture.")?;
         let id = self.inbox.post_capture_review(review.clone())?;
@@ -54,9 +69,7 @@ impl Worker {
         self.stop.check()?;
         if !answer.is_some_and(|a| a.allow == Some(true) && !a.always) {
             // A rejected capture is studied again on the next run, rather than silently reused.
-            *ws = Workspace::open(&ws.root)?;
-            ws.manifest.capture_deep = None;
-            ws.save()?;
+            invalidate_capture(ws)?;
             return Err(ToolError::new(ErrorCode::NoPermission, "The signed-in capture was not confirmed. The builder did not start.")
                 .with_remediation("Start a new study when you are ready to check the website and account again."));
         }
@@ -66,9 +79,15 @@ impl Worker {
         let saved = saved_for(&current);
         let fresh = capture_review::prepare(&current, saved.as_ref());
         *ws = current;
-        if fresh? != Some(review) {
-            return Err(ToolError::new(ErrorCode::NoPermission, "The website, account or capture changed while confirmation was waiting.")
-                .with_remediation("Start a new study and confirm its new screenshots. The builder did not start."));
+        match fresh {
+            Ok(Some(current)) if current == review => {}
+            result => {
+                invalidate_capture(ws)?;
+                return Err(result.err().unwrap_or_else(|| {
+                    ToolError::new(ErrorCode::NoPermission, "The website, account or capture changed while confirmation was waiting.")
+                        .with_remediation("Start a new study and confirm its new screenshots. The builder did not start.")
+                }));
+            }
         }
         self.stop.check()
     }

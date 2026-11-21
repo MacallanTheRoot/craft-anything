@@ -39,12 +39,23 @@ Craft Anything builder is marked as an agent and is refused as well.
 The worker posts one request, waits for its answer, and rechecks the complete capture digest,
 project target and saved-sign-in revision before preparing the builder. A missing answer times
 out after 30 minutes; cancellation wins even if an answer has arrived. Resuming or starting a new
-run asks again, so an earlier approval never authorizes another capture. A rejected capture is
-marked for a new study. Unsigned website studies retain their existing flow.
+run asks again, so an earlier approval never authorizes another capture. A rejected capture or a
+capture that fails validation is marked for a new study, including failures found after approval.
+The captured files and unrelated
+project work remain available for inspection. An unchanged approved capture remains reusable;
+cancellation keeps its existing behavior. Unsigned website studies retain their existing flow.
+
+The check inspects the root page and every captured route, including unindexed or incomplete
+route folders. An unsigned first page cannot bypass confirmation for a signed-in route. Every
+signed-in page must match the target website and current saved-account revision; mixed accounts,
+missing authentication records, and unsafe route paths require a new study. Only signed-in pages
+contribute preview screenshots, so a public landing page never stands in for private content.
+The desktop and CLI use the same project-relative screenshot list. Changes to any nested capture
+while approval is pending invalidate the answer.
 
 The absence of a password field is not proof of authentication. A detected password page is
-refused; the person must still recognize the screenshots. Old captures without a recorded authentication state, and signed-in captures without an
-account revision, require a new study. Files are bounded to 32 MiB each, 512 MiB in total, and 2,048
+refused; the person must still recognize the screenshots. Old captures without a recorded
+authentication state, and signed-in captures without an account revision, require a new study. Files are bounded to 32 MiB each, 512 MiB in total, and 2,048
 entries; links and nonregular files are refused. These checks protect normal project storage;
 they do not make an already trusted builder's shell a security sandbox.
 
