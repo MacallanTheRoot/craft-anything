@@ -38,6 +38,100 @@ fn problem(message: &str) -> ToolError {
         .with_remediation("Use web_site_sign_in to sign in again if needed, then start a new study. No captured account content was sent to the builder.")
 }
 
+/// Authentication identity chosen once for a website study. A saved profile is a seed, not
+/// proof of login. The screenshot approval still checks the captured page's sign-in state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StudyProfile {
+    version: u8,
+    signed_in: bool,
+    signed_in_site: Option<String>,
+    sign_in_revision: Option<String>,
+}
+
+impl StudyProfile {
+    fn from_metadata(metadata: &Value, key: &str) -> Result<Self, ToolError> {
+        let signed_in =
+            metadata.get("signed_in").and_then(Value::as_bool).ok_or_else(|| problem("The study browser did not record its authentication identity."))?;
+        let mut profile = Self { version: 1, signed_in, signed_in_site: None, sign_in_revision: None };
+        if signed_in {
+            let site = metadata.get("signed_in_site").and_then(Value::as_str);
+            let url_key = metadata.get("url").and_then(Value::as_str).and_then(|u| site_sign_in::site_key(u).ok());
+            if site != Some(key) || url_key.as_deref() != Some(key) {
+                return Err(problem("The study browser belongs to a different website."));
+            }
+            profile.signed_in_site = Some(key.to_string());
+            profile.sign_in_revision = Some(
+                metadata
+                    .get("sign_in_revision")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| problem("The study browser has no saved-account revision."))?
+                    .to_string(),
+            );
+        }
+        Ok(profile)
+    }
+
+    /// Read the actual browser identity and endpoint returned by web_site_open, never the
+    /// current saved-profile preference. Explicit endpoints prevent browser-tool fallback.
+    pub fn opened(url: &str, output: &crate::ToolOutput) -> Result<(Self, String), ToolError> {
+        let value = output.to_json();
+        let metadata = value.get("result").ok_or_else(|| problem("The study browser did not report its identity."))?;
+        let profile = Self::from_metadata(metadata, &site_sign_in::site_key(url)?)?;
+        let endpoint = metadata
+            .get("cdp_endpoint")
+            .and_then(Value::as_str)
+            .and_then(|e| craft_anything_engines::cdp::parse_endpoint(e).ok())
+            .ok_or_else(|| problem("The study browser did not provide a safe local endpoint."))?;
+        Ok((profile, endpoint.origin))
+    }
+
+    /// An originally unsigned study stays unsigned even if a sign-in is saved later.
+    pub fn open_params(&self, url: &str) -> Value {
+        serde_json::json!({"url": url, "signed_in": self.signed_in})
+    }
+
+    /// Reopening may start a new browser. Its account revision must match before any capture
+    /// or Deep reader can consume its content.
+    pub fn reopened(&self, url: &str, output: &crate::ToolOutput) -> Result<String, ToolError> {
+        let (profile, endpoint) = Self::opened(url, output)?;
+        if &profile != self {
+            return Err(problem("The browser's account changed during the study. A fresh study is required."));
+        }
+        Ok(endpoint)
+    }
+
+    pub fn check_captures(&self, ws: &Workspace) -> Result<(), ToolError> {
+        let TargetRef::Website { url } = &ws.manifest.target else { return Err(problem("The study's website changed.")) };
+        let key = site_sign_in::site_key(url)?;
+        let captures = capture_files(&ws.root)?;
+        let mut total = 0u64;
+        for page in page_folders(&ws.root, &captures)? {
+            let bytes = read(&ws.root, &page.join("capture.json"))?;
+            charge(&mut total, &bytes)?;
+            let metadata: Value = serde_json::from_slice(&bytes).map_err(|_| problem("A captured page's authentication record cannot be read."))?;
+            if Self::from_metadata(&metadata, &key)? != *self {
+                return Err(problem("The captured pages used different browser identities. A fresh study is required."));
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete Deep provenance only after all readers used a verified, explicit endpoint.
+    /// Legacy Deep captures without this record cannot establish which account was inspected.
+    pub fn record_deep(&self, ws: &Workspace) -> Result<(), ToolError> {
+        self.check_captures(ws)?;
+        let path = Path::new("capture.json");
+        let bytes = read(&ws.root, path)?;
+        let mut metadata: Value = serde_json::from_slice(&bytes).map_err(|_| problem("The capture record cannot be read."))?;
+        let object = metadata.as_object_mut().ok_or_else(|| problem("The capture record is not an object."))?;
+        object.insert("deep_study_profile".into(), serde_json::to_value(self).map_err(|_| problem("The Deep study's identity cannot be recorded."))?);
+        let bytes = serde_json::to_vec_pretty(&metadata).map_err(|_| problem("The capture record cannot be written."))?;
+        crate::project::write_atomic(&member(&ws.root, path)?, &bytes)
+    }
+}
+
 /// Resolve a capture member without following links, including a link at capture/ itself.
 fn member(root: &Path, relative: &Path) -> Result<PathBuf, ToolError> {
     let mut path = root.join("capture");
@@ -187,6 +281,19 @@ pub fn prepare(ws: &Workspace, saved: Option<&SavedSignIn>) -> Result<Option<Cap
         let bytes = read(&ws.root, &page.join("capture.json"))?;
         charge(&mut total, &bytes)?;
         let metadata: Value = serde_json::from_slice(&bytes).map_err(|_| problem("A captured page's authentication record cannot be read."))?;
+        if page.as_os_str().is_empty()
+            && (ws.manifest.capture_deep == Some(true) || captures.files.iter().any(|p| p == Path::new("how-it-works.md") || p == Path::new("original.har")))
+        {
+            let expected = StudyProfile::from_metadata(&metadata, &key)?;
+            let recorded: StudyProfile = metadata
+                .get("deep_study_profile")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .ok_or_else(|| problem("This Deep capture has no trustworthy browser identity. Start a fresh study."))?;
+            if recorded != expected {
+                return Err(problem("The Deep artifacts and captured pages used different browser identities. Start a fresh study."));
+            }
+        }
         match metadata.get("signed_in").and_then(Value::as_bool) {
             Some(false) => continue,
             Some(true) => {}

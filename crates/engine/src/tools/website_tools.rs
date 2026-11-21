@@ -240,7 +240,8 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
         browser_env(ctx.session.clean_room(), &browser),
     )
     .params(json!({"url": shown, "width": p.width, "height": p.height}))
-    .result(json!({"url": final_url, "title": title, "facts": facts, "health": health, "dialogs": dialogs, "browser": site.product, "signed_in": want.is_some(), "signed_in_site": want}))
+    .result(json!({"url": final_url, "title": title, "facts": facts, "health": health, "dialogs": dialogs, "browser": site.product,
+        "signed_in": want.is_some(), "signed_in_site": want, "sign_in_revision": site.sign_in_revision, "cdp_endpoint": site.endpoint.origin}))
     .summary(summary)
     .confidence(Confidence::Observed)
     .authority(Authority::OurRun)

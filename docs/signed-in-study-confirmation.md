@@ -53,6 +53,20 @@ contribute preview screenshots, so a public landing page never stands in for pri
 The desktop and CLI use the same project-relative screenshot list. Changes to any nested capture
 while approval is pending invalidate the answer.
 
+A new study chooses its browser profile at the first open and keeps that authentication identity
+through its route captures and Deep Mode. Saving a sign-in afterward does not upgrade an unsigned
+study. A signed-in study refuses a different saved-account revision on reopen. Each Deep reader
+(JavaScript analysis, observation and traffic recording) uses the verified browser's explicit
+local endpoint, so it cannot fall back to another session or launch a replacement browser.
+Reopen failures and cancellation stop the study before further readers or publication.
+
+Deep Mode records its profile provenance in `capture.json` after collecting its artifacts. The
+approval gate checks that provenance against the captured pages before it can skip confirmation
+for unsigned content. Older Deep captures without this record require a fresh study, even when
+their screenshots were unsigned: the account used for their analysis cannot be established.
+Valid signed-in Deep captures still require explicit screenshot confirmation. Rejected or
+invalidated captures require another study before reuse.
+
 The absence of a password field is not proof of authentication. A detected password page is
 refused; the person must still recognize the screenshots. Old captures without a recorded
 authentication state, and signed-in captures without an account revision, require a new study. Files are bounded to 32 MiB each, 512 MiB in total, and 2,048

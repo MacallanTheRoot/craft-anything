@@ -10,7 +10,8 @@ impl ChatModel for BoundaryModel {
         let prompt: String = req.messages.iter().map(crate::model::Msg::text).collect();
         let route = self.2.join("routes/account/README.md");
         let private_route = if route.is_file() { std::fs::read_to_string(route).unwrap() } else { String::new() };
-        self.0.lock().unwrap().push(format!("{prompt}{private_route}\n{}", std::fs::read_to_string(self.2.join("README.md")).unwrap()));
+        let deep = ["how-it-works.md", "original.har"].into_iter().filter_map(|f| std::fs::read_to_string(self.2.join(f)).ok()).collect::<String>();
+        self.0.lock().unwrap().push(format!("{prompt}{private_route}{deep}\n{}", std::fs::read_to_string(self.2.join("README.md")).unwrap()));
         self.1.cancel();
         Err(ToolError::new(ErrorCode::Cancelled, "Synthetic builder stopped at the boundary"))
     }
@@ -519,4 +520,258 @@ fn review_fix_unindexed_private_route_is_still_reviewed() {
     });
     assert!(asked.load(Ordering::SeqCst));
     assert!(f.seen.lock().unwrap().is_empty());
+}
+
+// Browser callbacks are synthetic; the worker, registered-tool dispatch, files, inbox and first
+// builder turn are real. No CDP server, real profile, browser process or network is used.
+#[derive(Clone, Default)]
+struct SyntheticBrowser {
+    signed_in: bool,
+    revision: Option<String>,
+    endpoint: String,
+}
+#[derive(Default)]
+struct DeepStudyFixture {
+    change_after_routes: bool,
+    replace_live_after_reopen: bool,
+    reopen_error: bool,
+    cancel_at: Option<&'static str>,
+    cancel_token: bool,
+    opens: usize,
+    captures: usize,
+    live: SyntheticBrowser,
+    browsers: HashMap<String, SyntheticBrowser>,
+    reads: Vec<(String, bool)>,
+}
+
+fn synthetic_account(session: &craft_anything_engine::Session, revision: &str) {
+    let dir = craft_anything_engine::tools::site_sign_in::sign_ins_dir(session).join("site-example.test_443");
+    std::fs::create_dir_all(dir.join("profile")).unwrap();
+    std::fs::write(dir.join("sign-in.json"), serde_json::to_vec(&json!({"version":1,"site":"site-example.test_443","revision":revision})).unwrap()).unwrap();
+}
+
+fn synthetic_study_tool(ctx: &mut craft_anything_engine::Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    use craft_anything_engine::tools::site_sign_in;
+    let state = ctx.session.ext.get::<Mutex<DeepStudyFixture>>().unwrap();
+    let mut state = state.lock().unwrap();
+    let deep_open = ctx.tool == "web_site_open" && state.opens % 3 == 2;
+    if state.cancel_at == Some(ctx.tool) && (ctx.tool != "web_site_open" || deep_open) {
+        if state.cancel_token {
+            ctx.cancel.cancel();
+        }
+        return Err(ToolError::cancelled());
+    }
+    match ctx.tool {
+        "web_site_open" => {
+            state.opens += 1;
+            if deep_open && state.reopen_error {
+                // A failed navigation/start may leave an older signed-in session alive.
+                state.live.signed_in = true;
+                return Err(ToolError::new(ErrorCode::EngineMissing, "Synthetic reopen failed"));
+            }
+            let saved = site_sign_in::saved(ctx.session, "site-example.test_443");
+            let signed_in = params.get("signed_in").and_then(Value::as_bool).unwrap_or(saved.is_some());
+            let browser = SyntheticBrowser {
+                signed_in,
+                revision: if signed_in { Some(saved.unwrap().revision) } else { None },
+                endpoint: format!("http://127.0.0.1:{}", 41000 + state.opens),
+            };
+            state.browsers.insert(browser.endpoint.clone(), browser.clone());
+            state.live = browser.clone();
+            if deep_open && state.replace_live_after_reopen {
+                state.live = SyntheticBrowser { signed_in: true, revision: Some("unintended-account".into()), endpoint: "http://127.0.0.1:42000".into() };
+            }
+            Ok(ToolOutput::Value(json!({"url":params["url"],"signed_in":browser.signed_in,
+                "signed_in_site":if browser.signed_in { Some("site-example.test_443") } else { None },
+                "sign_in_revision":browser.revision,"cdp_endpoint":browser.endpoint})))
+        }
+        "web_site_capture" => {
+            state.captures += 1;
+            let dir = PathBuf::from(params["output_directory"].as_str().unwrap());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("screenshot-1440.png"), encode_png(&Image { width: 2, height: 2, rgba: vec![80; 16] }).unwrap()).unwrap();
+            std::fs::write(dir.join("README.md"), "Synthetic account dashboard").unwrap();
+            let root = state.captures % 2 == 1;
+            let metadata = json!({"url":if root { "https://example.test/app" } else { "https://example.test/account" },
+                "signed_in":state.live.signed_in,"signed_in_site":if state.live.signed_in { Some("site-example.test_443") } else { None },
+                "sign_in_revision":state.live.revision,"sign_in_page":false,"screenshots":[{"file":"screenshot-1440.png"}],
+                "links":if root { json!([{"href":"https://example.test/account"}]) } else { json!([]) }});
+            std::fs::write(dir.join("capture.json"), serde_json::to_vec(&metadata).unwrap()).unwrap();
+            if !root && state.change_after_routes {
+                synthetic_account(ctx.session, "fixture-account-2");
+            }
+            Ok(ToolOutput::Value(json!({})))
+        }
+        "web_page_states_capture" => Ok(ToolOutput::Value(json!({}))),
+        _ => {
+            let browser = params.get("cdp_endpoint").and_then(Value::as_str).map(|e| state.browsers.get(e).unwrap()).unwrap_or(&state.live).clone();
+            state.reads.push((ctx.tool.to_string(), browser.signed_in));
+            let content = if browser.signed_in { "Synthetic PRIVATE Deep artifact" } else { "Synthetic PUBLIC Deep artifact" };
+            if ctx.tool == "web_walkthrough_record" {
+                use craft_anything_evidence::{Environment, EvidenceBuilder, Subject};
+                let ev = EvidenceBuilder::new(
+                    ctx.tool,
+                    Subject { kind: "website".into(), sha256: None, name: Some("Synthetic site".into()) },
+                    Environment::builtin(false),
+                )
+                .summary("Synthetic recording")
+                .result(json!({"network":{"requests":[{"url":"https://example.test/data","response_body":content}]}}))
+                .build()
+                .unwrap();
+                Ok(ToolOutput::evidence(ev))
+            } else {
+                Ok(ToolOutput::Value(json!({"content":content})))
+            }
+        }
+    }
+}
+
+impl Fixture {
+    fn fresh_deep(signed_in: bool, state: DeepStudyFixture) -> (Self, Arc<Mutex<DeepStudyFixture>>) {
+        let mut f = Self::new(signed_in);
+        let state = Arc::new(Mutex::new(state));
+        let mut session = craft_anything_engine::testing::session();
+        session.settings.deep_mode = true;
+        session.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
+        session.settings.build.max_pages = 1;
+        session.ext.insert(state.clone());
+        let callbacks: Vec<_> =
+            ["web_site_open", "web_site_capture", "web_page_states_capture", "web_page_js_analyze", "web_page_watch", "web_walkthrough_record"]
+                .into_iter()
+                .map(|id| (id, synthetic_study_tool as craft_anything_engine::tool::ToolFn))
+                .collect();
+        f.worker.engine = Arc::new(craft_anything_engine::testing::engine_with_callbacks(session, &callbacks));
+        if signed_in {
+            f.save_account("fixture-account-1");
+        }
+        f.ws.manifest.capture_deep = None;
+        f.ws.save().unwrap();
+        (f, state)
+    }
+    fn restart(&mut self) {
+        self.ws = Workspace::open(&self.ws.root).unwrap();
+        self.worker.stop = CancelToken::default();
+        self.worker.seen.clear();
+        self.seen.lock().unwrap().clear();
+    }
+}
+
+#[test]
+fn deep_profile_new_sign_in_cannot_upgrade_an_unsigned_study() {
+    let (mut f, state) = Fixture::fresh_deep(false, DeepStudyFixture { change_after_routes: true, ..Default::default() });
+    f.run(|_, _| panic!("a study that stays unsigned needs no account-content approval"));
+    assert_eq!(state.lock().unwrap().captures, 2, "the real Study must capture the root and route");
+    assert_eq!(f.seen.lock().unwrap().len(), 1);
+    assert!(f.seen.lock().unwrap()[0].contains("Synthetic PUBLIC Deep artifact"));
+    assert!(!f.seen.lock().unwrap()[0].contains("Synthetic PRIVATE Deep artifact"), "private Deep content bypassed confirmation");
+    assert!(state.lock().unwrap().reads.iter().all(|(_, signed)| !signed));
+}
+
+#[test]
+fn deep_profile_every_reader_stays_on_the_verified_browser() {
+    let (mut f, state) = Fixture::fresh_deep(false, DeepStudyFixture { replace_live_after_reopen: true, ..Default::default() });
+    f.run(|_, _| panic!("an unrelated session cannot upgrade this unsigned study"));
+    let reads = &state.lock().unwrap().reads;
+    assert_eq!(reads.len(), 3);
+    assert!(reads.iter().all(|(_, signed)| !signed), "a Deep tool fell back to an unintended signed-in session: {reads:?}");
+    assert!(!f.seen.lock().unwrap()[0].contains("Synthetic PRIVATE Deep artifact"));
+}
+
+#[test]
+fn deep_profile_account_replacement_stops_and_requires_a_new_study() {
+    let (mut f, state) = Fixture::fresh_deep(true, DeepStudyFixture { change_after_routes: true, ..Default::default() });
+    f.run(|_, _| panic!("a different account needs a new study, not approval of old screenshots"));
+    assert!(f.seen.lock().unwrap().is_empty());
+    assert!(state.lock().unwrap().reads.is_empty(), "Deep inspected a replacement account");
+    assert!(!f.ws.capture_dir().join("how-it-works.md").exists());
+    assert_eq!(Workspace::open(&f.ws.root).unwrap().manifest.capture_deep, None);
+    let before = state.lock().unwrap().captures;
+    state.lock().unwrap().change_after_routes = false;
+    f.restart();
+    f.run(|i, r| i.answer(&r.id, &Answer { allow: Some(false), ..Default::default() }).unwrap());
+    assert!(state.lock().unwrap().captures > before, "retry must study again");
+    assert!(f.seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn deep_profile_signed_in_study_requires_explicit_confirmation() {
+    for allow in [false, true] {
+        let (mut f, state) = Fixture::fresh_deep(true, DeepStudyFixture::default());
+        let seen = f.seen.clone();
+        let root = f.ws.root.clone();
+        let asked = Arc::new(AtomicBool::new(false));
+        let asked2 = asked.clone();
+        f.run(move |i, r| {
+            asked2.store(true, Ordering::SeqCst);
+            assert!(seen.lock().unwrap().is_empty());
+            assert!(std::fs::read_to_string(root.join("capture/how-it-works.md")).unwrap().contains("Synthetic PRIVATE Deep artifact"));
+            assert_eq!(r.capture_review.as_ref().unwrap().screenshots.len(), 2);
+            i.answer(&r.id, &Answer { allow: Some(allow), ..Default::default() }).unwrap();
+        });
+        assert!(asked.load(Ordering::SeqCst));
+        assert_eq!(f.seen.lock().unwrap().len(), usize::from(allow));
+        if allow {
+            assert!(f.seen.lock().unwrap()[0].contains("Synthetic PRIVATE Deep artifact"));
+        } else {
+            assert_eq!(Workspace::open(&f.ws.root).unwrap().manifest.capture_deep, None);
+            let before = state.lock().unwrap().captures;
+            f.restart();
+            f.run(|i, r| i.answer(&r.id, &Answer { allow: Some(false), ..Default::default() }).unwrap());
+            assert!(state.lock().unwrap().captures > before, "a rejected study was reused");
+        }
+    }
+}
+
+#[test]
+fn deep_profile_fully_unsigned_study_needs_no_confirmation() {
+    let (mut f, state) = Fixture::fresh_deep(false, DeepStudyFixture::default());
+    f.run(|_, _| panic!("fully unsigned Deep study asked for private-content confirmation"));
+    assert_eq!(f.seen.lock().unwrap().len(), 1);
+    assert!(state.lock().unwrap().reads.iter().all(|(_, signed)| !signed));
+    assert!(f.seen.lock().unwrap()[0].contains("Synthetic PUBLIC Deep artifact"));
+}
+
+#[test]
+fn deep_profile_reopen_errors_do_not_inspect_a_leftover_browser() {
+    let (mut f, state) = Fixture::fresh_deep(false, DeepStudyFixture { reopen_error: true, ..Default::default() });
+    let err = f.run(|_, _| panic!("failed reopening cannot authorize the old session"));
+    assert_eq!(err.code, ErrorCode::EngineMissing);
+    assert!(state.lock().unwrap().reads.is_empty());
+    assert!(f.seen.lock().unwrap().is_empty());
+    assert!(!f.ws.capture_dir().join("how-it-works.md").exists());
+    assert_eq!(Workspace::open(&f.ws.root).unwrap().manifest.capture_deep, None);
+}
+
+#[test]
+fn deep_profile_cancellation_stops_following_readers_and_publication() {
+    for tool in ["web_site_open", "web_page_js_analyze", "web_page_watch", "web_walkthrough_record"] {
+        for cancel_token in [false, true] {
+            let (mut f, state) = Fixture::fresh_deep(false, DeepStudyFixture { cancel_at: Some(tool), cancel_token, ..Default::default() });
+            let err = f.run(|_, _| panic!("cancelled study cannot authorize content"));
+            assert_eq!(err.code, ErrorCode::Cancelled);
+            let before = match tool {
+                "web_site_open" | "web_page_js_analyze" => 0,
+                "web_page_watch" => 1,
+                _ => 2,
+            };
+            assert_eq!(state.lock().unwrap().reads.len(), before, "tools ran after cancellation at {tool}");
+            assert!(f.seen.lock().unwrap().is_empty());
+            assert!(!f.ws.capture_dir().join("how-it-works.md").exists());
+            assert_eq!(Workspace::open(&f.ws.root).unwrap().manifest.capture_deep, None);
+        }
+    }
+}
+
+#[test]
+fn deep_profile_unattested_legacy_artifacts_are_invalidated_before_build() {
+    for signed_in in [false, true] {
+        let mut f = Fixture::new(signed_in);
+        f.worker.engine.session().settings.deep_mode = true;
+        f.ws.manifest.capture_deep = Some(true);
+        f.ws.save().unwrap();
+        std::fs::write(f.ws.capture_dir().join("how-it-works.md"), "Synthetic PRIVATE Deep artifact with unknown profile").unwrap();
+        f.run(|_, _| panic!("legacy Deep artifacts have no trustworthy profile provenance"));
+        assert!(f.seen.lock().unwrap().is_empty());
+        f.assert_invalidated_and_restudied();
+    }
 }
